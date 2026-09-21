@@ -183,109 +183,91 @@ CSV и журналы содержат сведения о группах и п�
 
 ## Порядок работы вручную
 
-**Сначала GET групп и проверка выбранной рассылки, только затем POST.** Ниже — независимые от Python-скрипта команды. Выполняйте этапы в одной сессии терминала. Для Bash/Zsh дополнительно нужны `curl` и `python3`; PowerShell использует встроенный `Invoke-RestMethod`.
+Здесь только прямые запросы **cURL**: Python, jq, функции и циклы не нужны. Выберите оболочку и выполняйте блоки по очереди в одной сессии.
+
+**GET групп → выбор `emailId` → GET разрешений → POST → проверка в Почте.** После каждого GET ожидается HTTP 200. При ошибке остановитесь и исправьте её, не выполняйте следующий блок. Команды не переходят к POST автоматически.
+
+Все ID ниже демонстрационные. Подставьте свою организацию и сотрудника; `EMAIL_ID` берите из GET по названию и адресу группы. Нужен `emailId` рассылки, а не `id` группы. Роль `mail_list_half_sender` сохранена согласно назначению проекта; её отличие от публично описанной роли объяснено в начале README.
 
 ### PowerShell
 
-#### 1. Токен и GET всех страниц групп
+В Windows PowerShell 5.1 и PowerShell 7 на Windows используйте **`curl.exe`**, чтобы вызвать именно cURL, а не псевдоним. В PowerShell на Linux/macOS замените `curl.exe` на `curl`.
 
-Подходит для Windows PowerShell 5.1 и PowerShell 7. Не используйте здесь Bash-конструкцию `<<JSON`. Имя `curl` в Windows PowerShell 5.1 может быть псевдонимом другого клиента, поэтому ниже выбран нативный HTTP-клиент.
+#### 1. Ввести токен и ID организации
 
 ```powershell
 $OrgId = '1234567'
 $SecureToken = Read-Host 'OAuth token' -AsSecureString
 $Token = [System.Net.NetworkCredential]::new('', $SecureToken).Password
-if ([string]::IsNullOrWhiteSpace($Token)) { throw 'Токен не введён' }
-$Headers = @{ Authorization = "OAuth $Token" }
-$GroupsReady = $false
-$Groups = @()
-$Page = 1
-
-do {
-    $Uri = "https://api360.yandex.net/directory/v1/org/$OrgId/groups?page=$Page&perPage=100"
-    $Response = Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -ErrorAction Stop
-    if ($null -eq $Response.groups -or $null -eq $Response.pages) {
-        throw 'В ответе GET отсутствуют groups/pages'
-    }
-    $Groups += @($Response.groups)
-    $Page++
-} while ($Page -le [int]$Response.pages)
-
-$GroupsOrgId = $OrgId
-$GroupsReady = $true
-$Groups | Where-Object { -not $_.removed -and $_.email -and $_.emailId } |
-    Select-Object name, email, emailId | Format-Table -AutoSize
 ```
 
-#### 2. Выбор рассылки и GET текущих разрешений
+#### 2. GET — найти группу
 
-Замените `EmailId` значением **из GET**, сверив название и адрес группы. `UserId` — UID сотрудника из карточки администратора. Все числа в примерах демонстрационные.
+```powershell
+$Page = 1
+curl.exe --silent --show-error --fail `
+  --request GET `
+  --header "Authorization: OAuth $Token" `
+  --write-out '\nHTTP %{http_code}\n' `
+  "https://api360.yandex.net/directory/v1/org/$OrgId/groups?page=$Page&perPage=100"
+```
+
+Найдите группу по `name` и `email`, скопируйте её `emailId`. Если нужной группы нет, посмотрите поле `pages`, установите `$Page = 2` и повторите **сам запрос cURL**; при необходимости продолжайте до последней страницы.
+
+#### 3. GET — посмотреть текущие разрешения
 
 ```powershell
 $EmailId = '1130000000000001'
 $UserId = '1130000000000101'
-$PermissionsReady = $false
-if (-not $GroupsReady -or $GroupsOrgId -ne $OrgId) {
-    throw 'Сначала выполните GET групп'
-}
-$Selected = @($Groups | Where-Object {
-    [string]$_.emailId -eq $EmailId -and -not $_.removed -and $_.email
-})
-if ($Selected.Count -ne 1) { throw 'Рассылка не найдена однозначно в GET' }
-$Selected | Select-Object name, email, emailId | Format-List
 
-$BaseUrl = "https://cloud-api.yandex.net/v1/admin/org/$OrgId/mail-lists/$EmailId"
-$Before = Invoke-RestMethod -Method Get -Uri "$BaseUrl/permissions" -Headers $Headers -ErrorAction Stop
-$Before | ConvertTo-Json -Depth 30
-$PermissionsTarget = "$OrgId/$EmailId"
-$PermissionsReady = $true
+curl.exe --silent --show-error --fail `
+  --request GET `
+  --header "Authorization: OAuth $Token" `
+  --write-out '\nHTTP %{http_code}\n' `
+  "https://cloud-api.yandex.net/v1/admin/org/$OrgId/mail-lists/$EmailId/permissions"
 ```
 
-#### 3. POST после проверки
+#### 4. POST — выдать право сотруднику
 
-`grant` выдаёт право одному сотруднику. Для отзыва пройдите GET-этапы заново и замените его на `revoke`.
+Выполните только после успешных GET и проверки идентификаторов.
+
+JSON передаётся через стандартный ввод cURL, чтобы сохранить кавычки в том числе в Windows PowerShell 5.1.
 
 ```powershell
-$Operation = 'grant'
-if (-not $PermissionsReady -or $PermissionsTarget -ne "$OrgId/$EmailId") {
-    throw 'Сначала выполните GET разрешений выбранной рассылки'
+$Body = @"
+{
+  "role_actions": [{
+    "type": "grant",
+    "roles": ["mail_list_half_sender"],
+    "subjects": [{
+      "type": "user",
+      "id": $UserId,
+      "org_id": $OrgId
+    }]
+  }]
 }
-if ($Operation -notin @('grant', 'revoke')) { throw 'Допустимы grant или revoke' }
-if ($UserId -notmatch '^[1-9][0-9]*$' -or $OrgId -notmatch '^[1-9][0-9]*$') {
-    throw 'Ожидаются числовые UID и ID организации'
-}
-$Body = @{
-    role_actions = @(@{
-        type = $Operation
-        roles = @('mail_list_half_sender')
-        subjects = @(@{
-            type = 'user'
-            id = [uint64]$UserId
-            org_id = [uint64]$OrgId
-        })
-    })
-} | ConvertTo-Json -Depth 10
-$Body
-$Expected = "$Operation $EmailId $UserId"
-if ((Read-Host "Для POST введите $Expected") -cne $Expected) { throw 'Отменено' }
-$PermissionsReady = $false
-$Request = @{
-    Method = 'Post'
-    Uri = "$BaseUrl/update-permissions"
-    Headers = $Headers
-    ContentType = 'application/json'
-    Body = $Body
-    ErrorAction = 'Stop'
-}
-Invoke-RestMethod @Request
-Write-Host 'POST завершён без HTTP-ошибки. Проверьте результат в Почте.'
+"@
+
+$Body | curl.exe --silent --show-error --fail `
+  --request POST `
+  --header "Authorization: OAuth $Token" `
+  --header 'Content-Type: application/json' `
+  --write-out '\nHTTP %{http_code}\n' `
+  --data-binary '@-' `
+  "https://cloud-api.yandex.net/v1/admin/org/$OrgId/mail-lists/$EmailId/update-permissions"
 ```
 
-Пустой ответ нормален: документированный статус успеха — HTTP 204. При HTTP-ошибке `-ErrorAction Stop` останавливает блок.
+Ожидается **HTTP 204**, тело ответа пустое. Закрывающая строка `"@` должна стоять без отступов.
+
+После работы:
+
+```powershell
+Remove-Variable Token, SecureToken -ErrorAction SilentlyContinue
+```
 
 ### Bash
 
-#### 1. Токен и организация
+#### 1. Ввести токен и ID организации
 
 ```bash
 OAUTH_TOKEN=''
@@ -294,11 +276,69 @@ printf '\n'
 ORG_ID='1234567'
 ```
 
-Затем выполните общие шаги 2–4 ниже.
+#### 2. GET — найти группу
+
+```bash
+PAGE=1
+curl --silent --show-error --fail \
+  --request GET \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --write-out '\nHTTP %{http_code}\n' \
+  "https://api360.yandex.net/directory/v1/org/${ORG_ID}/groups?page=${PAGE}&perPage=100"
+```
+
+Найдите группу по `name` и `email`, скопируйте её `emailId`. Если нужной группы нет, посмотрите поле `pages`, установите `PAGE=2` и повторите **сам запрос cURL**; при необходимости продолжайте до последней страницы.
+
+#### 3. GET — посмотреть текущие разрешения
+
+```bash
+EMAIL_ID='1130000000000001'
+USER_ID='1130000000000101'
+
+curl --silent --show-error --fail \
+  --request GET \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --write-out '\nHTTP %{http_code}\n' \
+  "https://cloud-api.yandex.net/v1/admin/org/${ORG_ID}/mail-lists/${EMAIL_ID}/permissions"
+```
+
+#### 4. POST — выдать право сотруднику
+
+Выполните только после успешных GET и проверки идентификаторов.
+
+```bash
+curl --silent --show-error --fail \
+  --request POST \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --header 'Content-Type: application/json' \
+  --write-out '\nHTTP %{http_code}\n' \
+  --data-binary @- \
+  "https://cloud-api.yandex.net/v1/admin/org/${ORG_ID}/mail-lists/${EMAIL_ID}/update-permissions" <<JSON
+{
+  "role_actions": [{
+    "type": "grant",
+    "roles": ["mail_list_half_sender"],
+    "subjects": [{
+      "type": "user",
+      "id": ${USER_ID},
+      "org_id": ${ORG_ID}
+    }]
+  }]
+}
+JSON
+```
+
+Ожидается **HTTP 204**, тело ответа пустое. Закрывающая строка `JSON` должна стоять без отступов.
+
+После работы:
+
+```bash
+unset OAUTH_TOKEN
+```
 
 ### Zsh
 
-#### 1. Токен и организация
+#### 1. Ввести токен и ID организации
 
 ```zsh
 OAUTH_TOKEN=''
@@ -307,158 +347,93 @@ printf '\n'
 ORG_ID='1234567'
 ```
 
-Затем выполните общие шаги 2–4 ниже. В Zsh `read -p` означает чтение из сопроцесса и может вызвать `no coprocess`.
+В Zsh не используйте Bash-вариант `read -p`: он вызывает `no coprocess`.
 
-### Общие шаги для Bash и Zsh
+#### 2. GET — найти группу
 
-Эти блоки одинаково работают в обеих оболочках. Функции останавливают этап через `return` при ошибке, не закрывая терминал.
-
-#### 2. GET всех страниц групп
-
-Ответы сохраняются в новом временном каталоге. Просмотрите группы и найдите нужный почтовый адрес.
-
-```sh
-get_groups() {
-  GROUPS_READY=''
-  [ -n "$OAUTH_TOKEN" ] || { printf 'Токен не введён\n' >&2; return 1; }
-  command -v python3 >/dev/null || return 1
-  WORK_DIR=$(mktemp -d) || return 1
-  PAGE=1
-  while :; do
-    HTTP_CODE=$(curl --silent --show-error --connect-timeout 15 --max-time 60 \
-      --header "Authorization: OAuth ${OAUTH_TOKEN}" \
-      --output "$WORK_DIR/groups-$PAGE.json" --write-out '%{http_code}' \
-      "https://api360.yandex.net/directory/v1/org/${ORG_ID}/groups?page=${PAGE}&perPage=100") || return 1
-    [ "$HTTP_CODE" = '200' ] || { printf 'GET: HTTP %s\n' "$HTTP_CODE" >&2; return 1; }
-    python3 -m json.tool "$WORK_DIR/groups-$PAGE.json" || return 1
-    PAGES=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d["groups"],list); p=d["pages"]; assert type(p) is int and p>=0; print(p)' "$WORK_DIR/groups-$PAGE.json") || return 1
-    [ "$PAGE" -ge "$PAGES" ] && break
-    PAGE=$((PAGE + 1))
-  done
-  GROUPS_ORG_ID="$ORG_ID"
-  GROUPS_READY=1
-}
-get_groups
+```zsh
+PAGE=1
+curl --silent --show-error --fail \
+  --request GET \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --write-out '\nHTTP %{http_code}\n' \
+  "https://api360.yandex.net/directory/v1/org/${ORG_ID}/groups?page=${PAGE}&perPage=100"
 ```
 
-#### 3. Выбор рассылки и GET текущих разрешений
+Найдите группу по `name` и `email`, скопируйте её `emailId`. Если нужной группы нет, посмотрите поле `pages`, установите `PAGE=2` и повторите **сам запрос cURL**; при необходимости продолжайте до последней страницы.
 
-Задайте `EMAIL_ID` по результату GET, а `USER_ID` — по карточке сотрудника.
+#### 3. GET — посмотреть текущие разрешения
 
-```sh
+```zsh
 EMAIL_ID='1130000000000001'
 USER_ID='1130000000000101'
 
-get_permissions() {
-  PERMISSIONS_READY=''
-  [ "$GROUPS_READY" = '1' ] && [ "$GROUPS_ORG_ID" = "$ORG_ID" ] || {
-    printf 'Сначала выполните GET групп\n' >&2; return 1;
-  }
-  python3 - "$WORK_DIR" "$EMAIL_ID" <<'PY'
-import json, pathlib, sys
-groups = []
-for path in pathlib.Path(sys.argv[1]).glob("groups-*.json"):
-    groups.extend(json.loads(path.read_text())["groups"])
-selected = [g for g in groups if str(g.get("emailId")) == sys.argv[2]
-            and not g.get("removed") and g.get("email")]
-if len(selected) != 1:
-    sys.exit("Рассылка не найдена однозначно в GET")
-print(json.dumps(selected[0], ensure_ascii=False, indent=2))
-PY
-  [ "$?" -eq 0 ] || return 1
-  BASE_URL="https://cloud-api.yandex.net/v1/admin/org/${ORG_ID}/mail-lists/${EMAIL_ID}"
-  HTTP_CODE=$(curl --silent --show-error --connect-timeout 15 --max-time 60 \
-    --header "Authorization: OAuth ${OAUTH_TOKEN}" \
-    --output "$WORK_DIR/permissions-before.json" --write-out '%{http_code}' \
-    "$BASE_URL/permissions") || return 1
-  [ "$HTTP_CODE" = '200' ] || { printf 'GET: HTTP %s\n' "$HTTP_CODE" >&2; return 1; }
-  python3 -m json.tool "$WORK_DIR/permissions-before.json" || return 1
-  PERMISSIONS_TARGET="$ORG_ID/$EMAIL_ID"
-  PERMISSIONS_READY=1
+curl --silent --show-error --fail \
+  --request GET \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --write-out '\nHTTP %{http_code}\n' \
+  "https://cloud-api.yandex.net/v1/admin/org/${ORG_ID}/mail-lists/${EMAIL_ID}/permissions"
+```
+
+#### 4. POST — выдать право сотруднику
+
+Выполните только после успешных GET и проверки идентификаторов.
+
+```zsh
+curl --silent --show-error --fail \
+  --request POST \
+  --header "Authorization: OAuth ${OAUTH_TOKEN}" \
+  --header 'Content-Type: application/json' \
+  --write-out '\nHTTP %{http_code}\n' \
+  --data-binary @- \
+  "https://cloud-api.yandex.net/v1/admin/org/${ORG_ID}/mail-lists/${EMAIL_ID}/update-permissions" <<JSON
+{
+  "role_actions": [{
+    "type": "grant",
+    "roles": ["mail_list_half_sender"],
+    "subjects": [{
+      "type": "user",
+      "id": ${USER_ID},
+      "org_id": ${ORG_ID}
+    }]
+  }]
 }
-get_permissions
+JSON
 ```
 
-#### 4. POST после проверки
+Ожидается **HTTP 204**, тело ответа пустое. Закрывающая строка `JSON` должна стоять без отступов.
 
-```sh
-OPERATION='grant'
+После работы:
 
-change_permission() {
-  [ "$PERMISSIONS_READY" = '1' ] && [ "$PERMISSIONS_TARGET" = "$ORG_ID/$EMAIL_ID" ] || {
-    printf 'Сначала выполните GET разрешений выбранной рассылки\n' >&2; return 1;
-  }
-  python3 - "$OPERATION" "$USER_ID" "$ORG_ID" > "$WORK_DIR/request.json" <<'PY'
-import json, re, sys
-operation, uid, org = sys.argv[1:]
-if operation not in ("grant", "revoke"):
-    sys.exit("Допустимы grant или revoke")
-if any(not re.fullmatch(r"[1-9][0-9]*", v) or int(v) > 2**64-1 for v in (uid, org)):
-    sys.exit("Ожидаются положительные целые ID в диапазоне uint64")
-json.dump({"role_actions": [{"type": operation, "roles": ["mail_list_half_sender"],
-          "subjects": [{"type": "user", "id": int(uid), "org_id": int(org)}]}]},
-          sys.stdout, indent=2)
-PY
-  [ "$?" -eq 0 ] || return 1
-  cat "$WORK_DIR/request.json"
-  printf '\nДля POST введите %s %s %s: ' "$OPERATION" "$EMAIL_ID" "$USER_ID"
-  read -r CONFIRM || return 1
-  [ "$CONFIRM" = "$OPERATION $EMAIL_ID $USER_ID" ] || { printf 'Отменено\n'; return 1; }
-  PERMISSIONS_READY=''
-  HTTP_CODE=$(curl --silent --show-error --connect-timeout 15 --max-time 60 \
-    --request POST \
-    --header "Authorization: OAuth ${OAUTH_TOKEN}" \
-    --header 'Content-Type: application/json' \
-    --data-binary "@$WORK_DIR/request.json" \
-    --output "$WORK_DIR/post-response.txt" --write-out '%{http_code}' \
-    "$BASE_URL/update-permissions") || {
-      printf 'Ответ не получен. Проверьте результат до повтора POST.\n' >&2; return 1;
-    }
-  printf 'HTTP %s\n' "$HTTP_CODE"
-  [ "$HTTP_CODE" = '204' ]
-}
-change_permission
-```
-
-Ожидается HTTP 204 с пустым телом. Ответ сохранён в `$WORK_DIR/post-response.txt`. Для отзыва повторите GET-этапы, установите `OPERATION='revoke'` и вызовите `change_permission`. Автоматического повтора POST нет.
-
-### Проверка после POST
-
-1. Повторите GET `/permissions` и сравните ответ с исходным, если API возвращает нужную роль. Отображение `mail_list_half_sender` в этом ответе публично не описано: отсутствие роли в GET само по себе не доказывает отсутствие права.
-2. Под указанным сотрудником обновите веб-Почту или войдите заново.
-3. После `grant` проверьте выбор адреса группы в поле «От кого», отправку на контролируемый адрес и фактического отправителя у получателя.
-4. После `revoke` проверьте, что отправка от имени группы недоступна, в том числе из старого черновика.
-
-GET текущих разрешений — дополнительная проверка, а не подтверждение поддержки роли. [Метод чтения разрешений приведён в справке Яндекса](https://yandex.ru/support/yandex-360/business/admin/ru/mail/mailbox-management/mailing-list).
-
-**Python-скрипт сейчас выполняет GET групп, но не GET разрешений.** Ручная последовательность выше включает оба. Успех GET не гарантирует успех POST.
-
-Очистите переменные с токеном после работы.
-
-PowerShell:
-
-```powershell
-Remove-Variable Token, SecureToken, Headers, Request -ErrorAction SilentlyContinue
-```
-
-Bash и Zsh:
-
-```sh
+```zsh
 unset OAUTH_TOKEN
 ```
 
-### Частые ошибки ручных команд
+### Отзыв права
 
-| Симптом | Что проверить |
+Заново выполните GET групп и GET разрешений для нужной рассылки. В теле POST замените только `"type": "grant"` на `"type": "revoke"`, сохранив роль и идентификаторы. Затем отправьте POST тем же способом. В PowerShell сначала заново задайте `$Body` с изменённым JSON. Ожидается HTTP 204.
+
+### Проверка результата
+
+После POST повторите GET разрешений из шага 3 и сравните результат с исходным. Отображение `mail_list_half_sender` в этом GET публично не описано: отсутствие роли в ответе само по себе не доказывает отсутствие права.
+
+Под указанным сотрудником обновите веб-Почту или войдите заново. После `grant` проверьте выбор адреса группы в поле «От кого», отправку на контролируемый адрес и фактического отправителя у получателя. После `revoke` убедитесь, что отправка от имени группы недоступна, в том числе из старого черновика.
+
+[GET разрешений описан в справке Яндекса](https://yandex.ru/support/yandex-360/business/admin/ru/mail/mailbox-management/mailing-list). Успешный GET не подтверждает поддержку роли для POST. Python-скрипт выполняет GET групп; ручные команды дополнительно включают GET разрешений.
+
+### Ошибки
+
+| Код / симптом | Что проверить |
 | --- | --- |
-| `read: -p: no coprocess` | Вы в Zsh; используйте отдельную команду ввода для Zsh. |
-| HTTP 401 | Токен введён, действителен и передаётся в заголовке OAuth. |
-| HTTP 403 | Административный доступ и scopes приложения. |
-| HTTP 400 | Роль, ID и JSON. Не подменяйте роль другой только ради успешного ответа. |
-| HTTP 404 | Организация и `emailId` из GET; обычный `id` группы не подходит. |
-| HTTP 429 | Выдержите серверный интервал, затем проверьте состояние перед повтором. |
-| Тайм-аут / 5xx после POST | Запрос мог примениться. Сначала проверьте результат в Почте. |
+| `read: -p: no coprocess` | Используйте ввод токена для Zsh. |
+| HTTP 401 | Токен введён и действителен. |
+| HTTP 403 | Административные права и scopes приложения. |
+| HTTP 400 | Роль, числовые ID и JSON. |
+| HTTP 404 | Организацию и `emailId` из GET. |
+| HTTP 429 | Выдержите серверный интервал перед дальнейшими запросами. |
+| Тайм-аут / 5xx после POST | Изменение могло примениться: проверьте результат до повтора POST. |
 
+В PowerShell символ продолжения строки — обратная кавычка; в Bash/Zsh — обратный слеш. После него не должно быть пробелов. URL копируйте обычной строкой, без Markdown-обёртки. Не добавляйте автоматические повторы POST.
 
 ## Разработка и локальная проверка
 
