@@ -172,6 +172,7 @@ ORG_ID='1234567'
 EMAIL_ID='1130000000000001'
 USER_ID='1130000000000101'
 ```
+для **macOS с zsh**:
 ```zsh
 read -r -s "OAUTH_TOKEN?OAuth token: "; printf '\n'
 ORG_ID='1234567' #укажите ваш orgID
